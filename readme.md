@@ -1,6 +1,8 @@
 # John Conway's Game of Life in LabGraph
 This is a project aimed at learning the core concepts of LabGraph. It builds a simple simulation graph and displays the resulting data using OpenCV.
 
+[Application preview](./docs/images/preview.gif)
+
 ## Running
 Clone the repository
 Create your virtual environment
@@ -18,3 +20,5 @@ Run setup.py to install required packages
 Run life!
 
     python graphoflife/simulation.py
+
+Press Esc to exit the simulation
