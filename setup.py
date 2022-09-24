@@ -8,7 +8,7 @@ setup(
     python_requires = ">=3.6",
     install_requires = [
         "labgraph==2.0.0",
-        "python-opencv>=4.6.0"
+        "opencv-python>=4.6.0"
     ],
     include_package_data = True
 )
