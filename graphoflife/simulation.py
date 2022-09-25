@@ -3,65 +3,71 @@ import argparse as ap
 import labgraph as lg
 import numpy as np
 import cv2
-from typing import Optional, Tuple, Callable
+from typing import Optional, Tuple
 import random
 import time
 
 # The length of the board's edge
 GRID_SIZE = 64
 # How many times per second to update the simulation
-CYCLE_RATE = 30
+CYCLE_RATE = 20
+# What size to scale the output image to
+SCALED_SIZE = 512
+# RGB value to paint active cells with
+ALIVE_CELL_COLOR = [255, 255, 255]
+# RGB value to paint dead cells with
+DEAD_CELL_COLOR = [0, 0, 0]
 
 # Utility class to track how many updates per second a thread is achieving
 class FramerateTracker():
-    deltaTime: int = 0
-    lastTickStart: float = 0
-    fpsTime: float = 0.0
+    deltaTimeNs: int = 0
+    lastTickStartNs: int = 0
+    fpsTimeNs: int = 0
     frameCount: int = 0
     fps: int = 0
-
-    onFpsTimerReset: Optional[Callable] = None
+    averaged: bool = False
 
     def tickStart(self):
-        self.lastTickStart = time.time()
+        self.lastTickStartNs = time.time_ns()
     
     def tickEnd(self):
-        self.deltaTime = time.time() - self.lastTickStart
-        self.fpsTime += self.deltaTime
+        self.deltaTimeNs = time.time_ns() - self.lastTickStartNs
+        self.fpsTimeNs += self.deltaTimeNs
         self.frameCount += 1
-
-        if self.fpsTime >= 1.0:
+        if not self.averaged:
             self.fps = self.frameCount
-            self.fpsTime = 0.0
-            self.frameCount = 0
 
-            if self.onFpsTimerReset is not None:
-                self.onFpsTimerReset()
+        if self.fpsTimeNs >= 1000000000:
+            self.fps = self.frameCount
+            self.fpsTimeNs = 0
+            self.frameCount = 0
+            self.averaged = True
 
 ### <Generator>
 # Generates the image data that is used to simulate the board
 # Each cycle of the generator steps the game forward one frame in time
 
 class CycleGeneratorConfig(lg.Config):
-    gridSize: lg.IntType
-    cycleRate: lg.IntType
+    gridSize: int
+    cycleRate: int
 
 # CycleGenerator publishes a CycleResult message containing a copy of the game board
 class CycleResult(lg.Message):
-    data: lg.NumpyType(shape = (GRID_SIZE, GRID_SIZE, 3))
+    data: lg.NumpyType(shape = (GRID_SIZE * GRID_SIZE,), dtype = np.int32)
     cycleRate: int
 
 # Data class for keeping track of the simulation
 class SimulationData(lg.State):
-    # The game board is represented as an image in memory
-    # Color is used to define whether a cell is alive or dead
-    grid: np.ndarray = np.ndarray(shape = (GRID_SIZE, GRID_SIZE, 3))
+    # The game board is represented as a 1-D array, 1 = alive, 0 = dead
+    grid: np.ndarray = np.zeros(shape = (GRID_SIZE * GRID_SIZE,), dtype = np.int32)
 
     fpsTracker: FramerateTracker = FramerateTracker()
 
-    def alive(self, x: int, y: int) -> int:
-        vals = self.grid[x][y]
-        return 1 if vals[0] + vals[1] + vals[2] > 0 else 0
+    # Get a cell's state and wrap coordinates if they're out of bounds
+    def getCell(self, x: int, y: int) -> int:
+        _x = GRID_SIZE - 1 if x < 0 else 0 if x > GRID_SIZE - 1 else x
+        _y = GRID_SIZE - 1 if y < 0 else 0 if y > GRID_SIZE - 1 else y
+        return self.grid[_y * GRID_SIZE + _x]
 
 class CycleGenerator(lg.Node):
     output = lg.Topic(CycleResult)
@@ -71,39 +77,43 @@ class CycleGenerator(lg.Node):
     @lg.publisher(output)
     async def doCycle(self) -> lg.AsyncPublisher:
         data: SimulationData = SimulationData()
-        # The game board is initialized with random values
-        data.grid = np.zeros(shape = (self.config.gridSize, self.config.gridSize, 3))
-        for x in range(1, self.config.gridSize - 1):
-                for y in range(1, self.config.gridSize - 1):
-                    color = [255, 255, 255] if random.randint(0, 1) == 1 else [0, 0, 0]
-                    data.grid[x][y] = color
+
+        # Initialize the grid with random states
+        for x in range(self.config.gridSize):
+                for y in range(self.config.gridSize):
+                    data.grid[y * self.config.gridSize + x] = random.randint(0, 1)
 
         while True:
+            startTimeNs = time.time_ns()
             data.fpsTracker.tickStart()
             # We need to operate on a copy of the board
             output: np.ndarray = np.copy(data.grid)
 
             # Sweep over the game board
-            for x in range(1, self.config.gridSize - 1):
-                for y in range(1, self.config.gridSize - 1):
+            for x in range(self.config.gridSize):
+                for y in range(self.config.gridSize):
 
-                    # Check surrounding neighbors and add one if they're alive
-                    neighbors =  data.alive(x - 1, y - 1) + data.alive(x - 0, y - 1) + data.alive(x + 1, y - 1)
-                    neighbors += data.alive(x - 1, y - 0) + 0                        + data.alive(x + 1, y - 0)
-                    neighbors += data.alive(x - 1, y + 1) + data.alive(x - 0, y + 1) + data.alive(x + 1, y + 1)
+                    # Check surrounding neighbors and add them up
+                    neighbors =  data.getCell(x - 1, y - 1) + data.getCell(x - 0, y - 1) + data.getCell(x + 1, y - 1)
+                    neighbors += data.getCell(x - 1, y - 0) + 0                          + data.getCell(x + 1, y - 0)
+                    neighbors += data.getCell(x - 1, y + 1) + data.getCell(x - 0, y + 1) + data.getCell(x + 1, y + 1)
 
                     # Update this cell's state
-                    color
-                    if data.alive(x, y) == 1:
-                        color = [255, 255, 255] if (neighbors == 2 or neighbors == 3) else [0, 0, 0]
+                    cellState = 0
+                    if data.getCell(x, y) == 1:
+                        cellState = int(neighbors == 2 or neighbors == 3)
                     else:
-                        color = [255, 255, 255] if (neighbors == 3) else [0, 0, 0]
-                    output[x][y] = color
+                        cellState = int(neighbors == 3)
+                    output[y * GRID_SIZE + x] = cellState
 
-            data.grid = np.copy(output)
+            data.grid = output
             # Send a message with the result of this cycle
-            yield self.output, CycleResult(data = np.copy(output), cycleRate = data.fpsTracker.fps)
-            await asyncio.sleep(1.0 / self.config.cycleRate)
+            yield self.output, CycleResult(data = output, cycleRate = data.fpsTracker.fps)
+            # Try to hit our target cycle rate
+            targetDtNs = 1000000000 / self.config.cycleRate
+            actualDtNs = time.time_ns() - startTimeNs
+            remainder = (targetDtNs - actualDtNs) / 1000000000
+            await asyncio.sleep(0 if remainder < 0 else remainder)
             data.fpsTracker.tickEnd()
 
 ### </Generator>
@@ -115,6 +125,7 @@ class CycleGenerator(lg.Node):
 class DisplayState(lg.State):
     data: Optional[np.ndarray] = None
     cycleRate: Optional[int] = None
+    changed: bool = True
 
 class Display(lg.Node):
     input = lg.Topic(CycleResult)
@@ -125,11 +136,11 @@ class Display(lg.Node):
     def onMessage(self, message: CycleResult) -> None:
         self.state.data = message.data
         self.state.cycleRate = message.cycleRate
+        self.state.changed = True
     
     @lg.main
     def display(self) -> None:
         fpsTracker: FramerateTracker = FramerateTracker()
-        fpsTracker.onFpsTimerReset = lambda : cv2.setWindowTitle("Graph of Life", "Graph of Life {0} FPS, {1} CPS".format(fpsTracker.fps, self.state.cycleRate))
 
         while self.state.data is None:
             continue
@@ -137,13 +148,26 @@ class Display(lg.Node):
         while True:
             fpsTracker.tickStart()
 
-            cv2.imshow("Graph of Life", cv2.resize(self.state.data, (512, 512), interpolation = cv2.INTER_NEAREST))
+            # Consruct an image to display if the data has changed
+            if self.state.changed:
+                img = np.zeros(shape = (GRID_SIZE, GRID_SIZE, 3))
+                for x in range(GRID_SIZE):
+                    for y in range(GRID_SIZE):
+                        img[x][y] = ALIVE_CELL_COLOR if self.state.data[y * GRID_SIZE + x] > 0 else DEAD_CELL_COLOR
+                
+                if SCALED_SIZE != GRID_SIZE:
+                    cv2.imshow("Graph of Life", cv2.resize(img, (SCALED_SIZE, SCALED_SIZE), interpolation = cv2.INTER_NEAREST))
+                else:
+                    cv2.imshow("Graph of Life", img)
+                self.state.changed = False
+
+            # Update the window title with performance telemetry
+            cv2.setWindowTitle("Graph of Life", "Graph of Life {0} FPS, {1} CPS".format(fpsTracker.fps, self.state.cycleRate))
 
             key = cv2.waitKey(1) & 0XFF
+            fpsTracker.tickEnd()
             if key == 27:
                 break
-
-            fpsTracker.tickEnd()
 
         cv2.destroyAllWindows()
         raise lg.NormalTermination()
