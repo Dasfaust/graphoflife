@@ -11,7 +11,7 @@ Create your virtual environment
 
 Drop into the venv (this example uses Windows)
 
-    call .venv\Scripts\activate.bat
+    call .venv/Scripts/activate.bat
 
 Run setup.py to install required packages
 
@@ -21,4 +21,4 @@ Run life!
 
     python graphoflife/simulation.py
 
-Press Esc to exit the simulation
+Press Esc to exit the simulation, Space to toggle pause, and 1 - 9 to load different starting templates

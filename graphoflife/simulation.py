@@ -1,201 +1,278 @@
 import asyncio
-import argparse as ap
 import labgraph as lg
 import numpy as np
 import cv2
 from typing import Optional, Tuple
 import random
 import time
+import os
 
-# The length of the board's edge
 GRID_SIZE = 64
-# How many times per second to update the simulation
-CYCLE_RATE = 20
-# What size to scale the output image to
-SCALED_SIZE = 512
-# RGB value to paint active cells with
-ALIVE_CELL_COLOR = [255, 255, 255]
-# RGB value to paint dead cells with
-DEAD_CELL_COLOR = [0, 0, 0]
+
+# Here's a rundown of what this graph looks like
+# <Display>  ---   <SimulationManager>
+#          \      /
+#           <Life>
 
 # Utility class to track how many updates per second a thread is achieving
-class FramerateTracker():
+class PerfUtility():
     deltaTimeNs: int = 0
-    lastTickStartNs: int = 0
-    fpsTimeNs: int = 0
-    frameCount: int = 0
-    fps: int = 0
+    lastUpdateStartNs: int = 0
+    updateTimerNs: int = 0
+    updateCount: int = 0
+    updatesPerSecond: int = 0
     averaged: bool = False
 
-    def tickStart(self):
-        self.lastTickStartNs = time.time_ns()
+    def updateStart(self):
+        self.lastUpdateStartNs = time.time_ns()
     
-    def tickEnd(self):
-        self.deltaTimeNs = time.time_ns() - self.lastTickStartNs
-        self.fpsTimeNs += self.deltaTimeNs
-        self.frameCount += 1
+    def updateEnd(self):
+        self.deltaTimeNs = time.time_ns() - self.lastUpdateStartNs
+        self.updateTimerNs += self.deltaTimeNs
+        self.updateCount += 1
         if not self.averaged:
-            self.fps = self.frameCount
+            self.updatesPerSecond = self.updateCount
 
-        if self.fpsTimeNs >= 1000000000:
-            self.fps = self.frameCount
-            self.fpsTimeNs = 0
-            self.frameCount = 0
+        if self.updateTimerNs >= 1000000000:
+            self.updatesPerSecond = self.updateCount
+            self.updateTimerNs = 0
+            self.updateCount = 0
             self.averaged = True
 
-### <Generator>
-# Generates the image data that is used to simulate the board
-# Each cycle of the generator steps the game forward one frame in time
+## <Messages>
+# The various topics each node uses to communicate with each other
 
-class CycleGeneratorConfig(lg.Config):
-    gridSize: int
-    cycleRate: int
+# We've broken the values out into easy to handle objects
+# Storing lg.Message types and accessing them directly seems to be a lot slower than keeping a view to an object contained inside
+class SimulationValues():
+    grid: lg.NumpyType(shape = (GRID_SIZE * GRID_SIZE,), dtype = np.int32)
+    iterations: int
+    updatesPerSecond: int
 
-# CycleGenerator publishes a CycleResult message containing a copy of the game board
-class CycleResult(lg.Message):
-    data: lg.NumpyType(shape = (GRID_SIZE * GRID_SIZE,), dtype = np.int32)
-    cycleRate: int
+class MessageSimulationData(lg.Message):
+    values: SimulationValues
+
+class ConfigValues():
+    scaledSize: int
+    updateRate: int
+    paused: bool
+    startingGrid: lg.NumpyType(shape = (GRID_SIZE * GRID_SIZE,), dtype = np.int32)
+    gridChanged: bool
+    configChanged: bool
+    threadPoolSize: int
+
+class MessageSimulationConfig(lg.Message):
+    values: ConfigValues
+
+## </Messages>
+
+## <SimulationManager>
+# Steps the simulation forward, sends a MessageSimulationData type to Display
+# Also receives configuration (MessageSimulationConfig) from Display 
+# The game board is represented as a 1-D array, 1 = alive, 0 = dead
 
 # Data class for keeping track of the simulation
-class SimulationData(lg.State):
-    # The game board is represented as a 1-D array, 1 = alive, 0 = dead
-    grid: np.ndarray = np.zeros(shape = (GRID_SIZE * GRID_SIZE,), dtype = np.int32)
+class SimulationState(lg.State):
+    data: Optional[SimulationValues] = None
+    config: Optional[ConfigValues] = None
 
-    fpsTracker: FramerateTracker = FramerateTracker()
+class SimulationManager(lg.Node):
+    topicSimulationConfig = lg.Topic(MessageSimulationConfig)
+    topicSimulationData = lg.Topic(MessageSimulationData)
+
+    state: SimulationState
 
     # Get a cell's state and wrap coordinates if they're out of bounds
-    def getCell(self, x: int, y: int) -> int:
+    # TODO: this isn't wrapping like you'd expect, but it works
+    def readCell(self, x: int, y: int) -> int:
         _x = GRID_SIZE - 1 if x < 0 else 0 if x > GRID_SIZE - 1 else x
         _y = GRID_SIZE - 1 if y < 0 else 0 if y > GRID_SIZE - 1 else y
-        return self.grid[_y * GRID_SIZE + _x]
+        return self.state.data.grid[_y * GRID_SIZE + _x]
 
-class CycleGenerator(lg.Node):
-    output = lg.Topic(CycleResult)
+    @lg.subscriber(topicSimulationConfig)
+    def onConfig(self, message: MessageSimulationConfig) -> None:
+        self.state.config = message.values
 
-    config: CycleGeneratorConfig
-
-    @lg.publisher(output)
-    async def doCycle(self) -> lg.AsyncPublisher:
-        data: SimulationData = SimulationData()
-
-        # Initialize the grid with random states
-        for x in range(self.config.gridSize):
-                for y in range(self.config.gridSize):
-                    data.grid[y * self.config.gridSize + x] = random.randint(0, 1)
+    @lg.publisher(topicSimulationData)
+    async def publishState(self) -> lg.AsyncPublisher:
+        perf: PerfUtility = PerfUtility()
 
         while True:
+            # Wait for the config message to arive before getting started
+            if self.state.config is None:
+                await asyncio.sleep(0.01)
+                continue
+            # Aditionally, handle run-time config updates such as new templates and pausing
+            elif self.state.data is None:
+                self.state.data = SimulationValues()
+                self.state.data.grid = np.copy(self.state.config.startingGrid)
+                self.state.data.iterations = 0
+                self.state.data.updatesPerSecond = perf.updatesPerSecond
+                self.state.config.gridChanged = False
+            elif self.state.config.gridChanged:
+                self.state.data.grid = np.copy(self.state.config.startingGrid)
+                self.state.data.iterations = 0
+                self.state.config.gridChanged = False
+
+            perf.updateStart()
             startTimeNs = time.time_ns()
-            data.fpsTracker.tickStart()
-            # We need to operate on a copy of the board
-            output: np.ndarray = np.copy(data.grid)
 
-            # Sweep over the game board
-            for x in range(self.config.gridSize):
-                for y in range(self.config.gridSize):
+            if not self.state.config.paused:
+                # We need to operate on a copy of the grid
+                grid: np.ndarray = np.copy(self.state.data.grid)
+                
+                # Sweep over the game's grid
+                for x in range(GRID_SIZE):
+                    for y in range(GRID_SIZE):
 
-                    # Check surrounding neighbors and add them up
-                    neighbors =  data.getCell(x - 1, y - 1) + data.getCell(x - 0, y - 1) + data.getCell(x + 1, y - 1)
-                    neighbors += data.getCell(x - 1, y - 0) + 0                          + data.getCell(x + 1, y - 0)
-                    neighbors += data.getCell(x - 1, y + 1) + data.getCell(x - 0, y + 1) + data.getCell(x + 1, y + 1)
+                        # Check surrounding neighbor cells and add them up
+                        neighbors =  self.readCell(x - 1, y - 1) + self.readCell(x - 0, y - 1) + self.readCell(x + 1, y - 1)
+                        neighbors += self.readCell(x - 1, y - 0) + 0                           + self.readCell(x + 1, y - 0)
+                        neighbors += self.readCell(x - 1, y + 1) + self.readCell(x - 0, y + 1) + self.readCell(x + 1, y + 1)
 
-                    # Update this cell's state
-                    cellState = 0
-                    if data.getCell(x, y) == 1:
-                        cellState = int(neighbors == 2 or neighbors == 3)
-                    else:
-                        cellState = int(neighbors == 3)
-                    output[y * GRID_SIZE + x] = cellState
+                        # Update this cell's state
+                        cellState = 0
+                        if self.readCell(x, y) == 1:
+                            cellState = int(neighbors == 2 or neighbors == 3)
+                        else:
+                            cellState = int(neighbors == 3)
+                        grid[y * GRID_SIZE + x] = cellState
 
-            data.grid = output
+
+                self.state.data.grid = grid
+                self.state.data.iterations += 1
+            self.state.data.updatesPerSecond = perf.updatesPerSecond
+
             # Send a message with the result of this cycle
-            yield self.output, CycleResult(data = output, cycleRate = data.fpsTracker.fps)
-            # Try to hit our target cycle rate
-            targetDtNs = 1000000000 / self.config.cycleRate
-            actualDtNs = time.time_ns() - startTimeNs
-            remainder = (targetDtNs - actualDtNs) / 1000000000
-            await asyncio.sleep(0 if remainder < 0 else remainder)
-            data.fpsTracker.tickEnd()
+            yield self.topicSimulationData, MessageSimulationData(values = self.state.data)
 
-### </Generator>
+            # Try to hit our target update rate
+            targetDeltaTimeNs: int = int(1000000000 / self.state.config.updateRate)
+            actualDetlaTimeNs: int = time.time_ns() - startTimeNs
+            sleepTime: float = float((targetDeltaTimeNs - actualDetlaTimeNs) / 1000000000)
+            await asyncio.sleep(0 if sleepTime < 0 else sleepTime)
+
+            perf.updateEnd()
+
+## </SimulationManager>
+
 
 ### <Display>
-# Recieves messages from CycleGenerator and presents them to the screen using CV2
+# Recieves MessageSimulationData from SimulationManager, converts them to an image, and shows them on the screen using CV2
 
-# Keep a reference of the last message recieved so we can present it
 class DisplayState(lg.State):
-    data: Optional[np.ndarray] = None
-    cycleRate: Optional[int] = None
-    changed: bool = True
+    data: Optional[SimulationValues] = None
+    dataChanged: bool = True
+    config: Optional[ConfigValues] = None
 
 class Display(lg.Node):
-    input = lg.Topic(CycleResult)
+    topicSimulationConfig = lg.Topic(MessageSimulationConfig)
+    topicSimulationData = lg.Topic(MessageSimulationData)
 
     state: DisplayState
 
-    @lg.subscriber(input)
-    def onMessage(self, message: CycleResult) -> None:
-        self.state.data = message.data
-        self.state.cycleRate = message.cycleRate
-        self.state.changed = True
+    # Utility function for loading an image from file
+    # TODO: handle other sizes than the default setting (64, 64) properly
+    def loadImage(self, name) -> None:
+        path = os.path.dirname(os.path.realpath(__file__))
+        img = cv2.imread("{0}/templates/{1}.png".format(path, name), flags = cv2.IMREAD_COLOR)
+        for x in range(GRID_SIZE):
+            for y in range(GRID_SIZE):
+                self.state.config.startingGrid[y * GRID_SIZE + x] = int(img[x][y][0] > 0)
+        self.state.config.paused = True
+        self.state.config.gridChanged = True
+        self.state.config.configChanged = True
+
+    @lg.publisher(topicSimulationConfig)
+    async def updateConfig(self) -> lg.AsyncPublisher:
+        self.state.config = ConfigValues()
+        self.state.config.scaledSize = 512
+        self.state.config.updateRate = 20
+        self.state.config.paused = True
+        self.state.config.startingGrid = np.zeros(shape = (GRID_SIZE * GRID_SIZE,), dtype = np.int32)
+        self.state.config.gridChanged = False
+        self.state.config.configChanged = True
+        self.state.config.threadPoolSize = 4
+
+        # Initialize the default grid used by SimulationManager to random values
+        for x in range(GRID_SIZE):
+                for y in range(GRID_SIZE):
+                    self.state.config.startingGrid[y * GRID_SIZE + x] = random.randint(0, 1)
+
+        # If we've made a config change while the program is running, let the other nodes know
+        while True:
+            if self.state.config.configChanged:
+                yield self.topicSimulationConfig, MessageSimulationConfig(values = self.state.config)
+                self.state.config.configChanged = False
+            else:
+                await asyncio.sleep(0.5)
     
+    @lg.subscriber(topicSimulationData)
+    def onSimState(self, message: MessageSimulationData) -> None:
+        self.state.data = message.values
+        self.state.dataChanged = True
+
     @lg.main
     def display(self) -> None:
-        fpsTracker: FramerateTracker = FramerateTracker()
+        perf: PerfUtility = PerfUtility()
 
         while self.state.data is None:
             continue
-        
+
+        img = np.zeros(shape = (GRID_SIZE, GRID_SIZE, 3), dtype = np.uint8)
         while True:
-            fpsTracker.tickStart()
+            perf.updateStart()
 
             # Consruct an image to display if the data has changed
-            if self.state.changed:
-                img = np.zeros(shape = (GRID_SIZE, GRID_SIZE, 3))
+            if self.state.dataChanged:
                 for x in range(GRID_SIZE):
                     for y in range(GRID_SIZE):
-                        img[x][y] = ALIVE_CELL_COLOR if self.state.data[y * GRID_SIZE + x] > 0 else DEAD_CELL_COLOR
+                        img[x][y] = np.array([255, 255, 255]) * self.state.data.grid[y * GRID_SIZE + x]
                 
-                if SCALED_SIZE != GRID_SIZE:
-                    cv2.imshow("Graph of Life", cv2.resize(img, (SCALED_SIZE, SCALED_SIZE), interpolation = cv2.INTER_NEAREST))
+                if GRID_SIZE != self.state.config.scaledSize:
+                    cv2.imshow("Graph of Life", cv2.resize(img, (self.state.config.scaledSize, self.state.config.scaledSize), interpolation = cv2.INTER_NEAREST))
                 else:
                     cv2.imshow("Graph of Life", img)
-                self.state.changed = False
+                self.state.dataChanged = False
+                
+                # Update the window title with performance telemetry
+                cv2.setWindowTitle("Graph of Life", "Graph of Life {0} FPS, {1} UPS, {2} iterations".format(perf.updatesPerSecond, self.state.data.updatesPerSecond, self.state.data.iterations))
 
-            # Update the window title with performance telemetry
-            cv2.setWindowTitle("Graph of Life", "Graph of Life {0} FPS, {1} CPS".format(fpsTracker.fps, self.state.cycleRate))
-
+            # Various controls
+            # TODO: keys don't have the same values on every platform
             key = cv2.waitKey(1) & 0XFF
-            fpsTracker.tickEnd()
-            if key == 27:
+            perf.updateEnd()
+            # Pause the program
+            if key == 32:
+                self.state.config.paused = not self.state.config.paused
+                self.state.config.configChanged = True
+            # Quickly load images named 1 - 9 with numerical keys
+            elif key >= 49 and key <= 57:
+                self.loadImage(key - 48)
+            # Quit the program
+            elif key == 27:
                 break
 
         cv2.destroyAllWindows()
-        raise lg.NormalTermination()
+        raise lg.NormalTermination
 
 ### </Display>
 
-### <Graph>
-# This is the root node of the computational graph, it connects messaging between CycleGenerator and Display, additionally configures the nodes
+### <Life>
+# This is the root node of the computational graph, it connects messaging between SimulationManager and Display
 
-class Demo(lg.Graph):
-    generator: CycleGenerator
+class Life(lg.Graph):
+    simulationManager: SimulationManager
     display: Display
 
-    def setup(self) -> None:
-        self.generator.configure(
-            CycleGeneratorConfig(
-                gridSize = GRID_SIZE,
-                cycleRate = CYCLE_RATE
-            )
-        )
-
     def connections(self) -> lg.Connections:
-        return ((self.generator.output, self.display.input),)
+        return ((self.display.topicSimulationConfig, self.simulationManager.topicSimulationConfig),
+                (self.simulationManager.topicSimulationData, self.display.topicSimulationData))
     
     def process_modules(self) -> Tuple[lg.Module, ...]:
-        return (self.generator, self.display)
+        return (self.simulationManager, self.display)
 
 ### </Graph>
 
 if __name__ == "__main__":
-    lg.run(Demo)
+    lg.run(Life)
